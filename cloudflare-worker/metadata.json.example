@@ -1,0 +1,11 @@
+{
+  "main_module": "worker.js",
+  "compatibility_date": "2026-06-05",
+  "bindings": [
+    {
+      "type": "kv_namespace",
+      "name": "BACKUP_KV",
+      "namespace_id": "replace-with-kv-namespace-id"
+    }
+  ]
+}

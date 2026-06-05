@@ -1,0 +1,1977 @@
+name: CashNest X
+run-name: CashNest X
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main          # every push to main → build + release
+  workflow_dispatch:  # manual "Run workflow" button → build + release
+
+# ─── Permissions ──────────────────────────────────────────────────────────────
+permissions:
+  contents: write   # needed to create GitHub Releases
+
+jobs:
+  build:
+    name: Build Signed APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Node.js ───────────────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── 3. Preflight required GitHub Secrets ────────────────────────────────
+      - name: Check required GitHub Secrets
+        run: |
+          missing=0
+          for key in KEYSTORE_BASE64 KEY_ALIAS KEY_PASSWORD STORE_PASSWORD; do
+            value="${!key}"
+            if [ -z "$value" ]; then
+              echo "❌ Missing GitHub Secret: $key"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "Add missing secrets in: Repository Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "✅ Required secrets are present"
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+
+      # ── 4. Install npm dependencies ──────────────────────────────────────────
+      - name: Install npm dependencies
+        shell: bash
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_PROGRESS: "false"
+        run: |
+          set -euo pipefail
+          echo "Node: $(node -v)"
+          echo "npm:  $(npm -v)"
+          npm config set registry https://registry.npmjs.org/
+
+          # Stop immediately if package-lock still points to a private/internal registry.
+          if grep -R "packages.applied-caas\|artifactory\|internal.api.openai" package-lock.json .npmrc 2>/dev/null; then
+            echo "❌ Bad npm registry URL found in package-lock.json/.npmrc"
+            exit 1
+          fi
+
+          npm install --no-audit --no-fund --prefer-online --registry=https://registry.npmjs.org/
+          test -x node_modules/.bin/vite
+          npx vite --version
+
+      - name: Release safety check
+        run: npm run release:check
+        env:
+          VITE_GITHUB_REPO: ${{ github.repository }}
+
+      # ── 5. Derive app version from workflow run number ───────────────────────
+      # Correct mapping: run #11 → v0.1.1, run #139 → v1.3.9. No forced major version for early runs.
+      # Android versionCode still uses github.run_number because it must only go up.
+      - name: Derive app version
+        id: versioning
+        run: node scripts/derive-version.cjs
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+      # ── 6. Write version into package.json ───────────────────────────────────
+      # So VITE_APP_VERSION can match the release tag.
+      - name: Write version into package.json
+        run: |
+          cat > /tmp/set-version.js << 'JSEOF'
+          const fs  = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.version = process.env.VERSION;
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          console.log('✅ package.json version set to', pkg.version);
+          JSEOF
+          node /tmp/set-version.js
+
+
+      # ── 7. Build web app (Vite) ───────────────────────────────────────────────
+      - name: Build web app (Vite)
+        run: npm run build
+        env:
+          VITE_GITHUB_REPO: ${{ github.repository }}
+          VITE_APP_VERSION: ${{ env.VERSION }}
+          VITE_GITHUB_TOKEN: ${{ secrets.VITE_GITHUB_TOKEN }}
+          VITE_APP_NAME: CashNest X
+          VITE_APP_PACKAGE_NAME: ${{ vars.VITE_APP_PACKAGE_NAME || 'com.cashnest_x.pub' }}
+          VITE_PUBLIC_APK: ${{ vars.VITE_PUBLIC_APK || secrets.VITE_PUBLIC_APK || 'true' }}
+          VITE_ENABLE_FIREBASE_AUTH: ${{ vars.VITE_ENABLE_FIREBASE_AUTH || secrets.VITE_ENABLE_FIREBASE_AUTH || vars.VITE_ENABLE_GOOGLE_BACKUP || secrets.VITE_ENABLE_GOOGLE_BACKUP || 'false' }}
+          VITE_ENABLE_GOOGLE_BACKUP: ${{ vars.VITE_ENABLE_FIREBASE_AUTH || secrets.VITE_ENABLE_FIREBASE_AUTH || vars.VITE_ENABLE_GOOGLE_BACKUP || secrets.VITE_ENABLE_GOOGLE_BACKUP || 'false' }}
+          VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+          VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+          VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+          VITE_FIREBASE_WEB_CLIENT_ID: ${{ secrets.VITE_FIREBASE_WEB_CLIENT_ID || secrets.VITE_GOOGLE_CLIENT_ID }}
+          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_FIREBASE_WEB_CLIENT_ID || secrets.VITE_GOOGLE_CLIENT_ID }}
+          VITE_CLOUDFLARE_WORKER_URL: ${{ secrets.VITE_CLOUDFLARE_WORKER_URL }}
+          VITE_CLOUDFLARE_BACKUP_KEY: ${{ secrets.VITE_CLOUDFLARE_BACKUP_KEY }}
+
+      # ── 8. Java ───────────────────────────────────────────────────────────────
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # ── 9. Android SDK ────────────────────────────────────────────────────────
+      # Use the Android SDK already available on GitHub ubuntu runners.
+      # Do NOT call android-actions/setup-android here: it can try to install/update
+      # the Android Emulator package, and GitHub mirrors sometimes return a corrupt
+      # emulator zip which fails the whole APK build before Gradle starts.
+      - name: Set up Android SDK paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          if [ -d "$SDK_ROOT/cmdline-tools/latest/bin" ]; then
+            echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          fi
+          if [ -d "$SDK_ROOT/cmdline-tools/16.0/bin" ]; then
+            echo "$SDK_ROOT/cmdline-tools/16.0/bin" >> "$GITHUB_PATH"
+          fi
+          echo "✅ Android SDK root: $SDK_ROOT"
+          find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager | sort || true
+
+      - name: Install required Android SDK components only
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=""
+          for candidate in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/16.0/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/15.0/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/bin/sdkmanager"; do
+            if [ -x "$candidate" ]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            echo "❌ sdkmanager not found under $SDK_ROOT"
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+          "$SDKMANAGER" --list_installed | grep -E 'platform-tools|platforms;android-35|build-tools;35.0.0'
+
+      # ── 10. Capacitor — generate Android project ──────────────────────────────
+      - name: Apply optional fork package name
+        shell: bash
+        env:
+          VITE_APP_PACKAGE_NAME: ${{ vars.VITE_APP_PACKAGE_NAME || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VITE_APP_PACKAGE_NAME:-}" ]; then
+            node - <<'NODE'
+          const fs = require('fs');
+          const appId = process.env.VITE_APP_PACKAGE_NAME.trim();
+          if (!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(appId)) {
+            throw new Error(`Invalid VITE_APP_PACKAGE_NAME: ${appId}`);
+          }
+          const cap = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          cap.appId = appId;
+          cap.appName = 'CashNest X';
+          fs.writeFileSync('capacitor.config.json', JSON.stringify(cap, null, 2) + '\n');
+          console.log(`✅ Capacitor package set to ${appId}`);
+          NODE
+          else
+            echo "✅ Using package from capacitor.config.json"
+          fi
+
+      - name: Add Capacitor Android platform
+        run: |
+          if [ ! -d android ]; then
+            npx cap add android
+          else
+            echo "android folder already exists — skip cap add"
+          fi
+
+      - name: Add native APK installer, biometric, receipt, export, and Google plugins
+        env:
+          VITE_PUBLIC_APK: ${{ vars.VITE_PUBLIC_APK || secrets.VITE_PUBLIC_APK || 'true' }}
+          VITE_ENABLE_FIREBASE_AUTH: ${{ vars.VITE_ENABLE_FIREBASE_AUTH || secrets.VITE_ENABLE_FIREBASE_AUTH || vars.VITE_ENABLE_GOOGLE_BACKUP || secrets.VITE_ENABLE_GOOGLE_BACKUP || 'false' }}
+          VITE_ENABLE_GOOGLE_BACKUP: ${{ vars.VITE_ENABLE_FIREBASE_AUTH || secrets.VITE_ENABLE_FIREBASE_AUTH || vars.VITE_ENABLE_GOOGLE_BACKUP || secrets.VITE_ENABLE_GOOGLE_BACKUP || 'false' }}
+          VITE_FIREBASE_WEB_CLIENT_ID: ${{ secrets.VITE_FIREBASE_WEB_CLIENT_ID || secrets.VITE_GOOGLE_CLIENT_ID }}
+          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_FIREBASE_WEB_CLIENT_ID || secrets.VITE_GOOGLE_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          JAVA_PACKAGE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('capacitor.config.json','utf8')).appId || 'com.cashnest_x.pub')")
+          JAVA_DIR="android/app/src/main/java/${JAVA_PACKAGE//./\/}"
+          export JAVA_PACKAGE JAVA_DIR
+          mkdir -p "$JAVA_DIR" android/app/src/main/res/xml
+          PUBLIC_FLAG="${VITE_PUBLIC_APK:-true}"
+          GOOGLE_FLAG="${VITE_ENABLE_FIREBASE_AUTH:-${VITE_ENABLE_GOOGLE_BACKUP:-false}}"
+          GOOGLE_WEB_CLIENT_ID="${VITE_FIREBASE_WEB_CLIENT_ID:-${VITE_GOOGLE_CLIENT_ID:-}}"
+          GOOGLE_BACKUP_NATIVE_ENABLED="false"
+          if [ "$GOOGLE_FLAG" = "true" ] && [ -n "$GOOGLE_WEB_CLIENT_ID" ]; then
+            GOOGLE_BACKUP_NATIVE_ENABLED="true"
+          fi
+          export GOOGLE_BACKUP_NATIVE_ENABLED
+          echo "✅ Java package: $JAVA_PACKAGE"
+          echo "✅ Firebase Google native plugin enabled: $GOOGLE_BACKUP_NATIVE_ENABLED"
+
+          cat > "$JAVA_DIR/MainActivity.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(ApkInstallerPlugin.class);
+                  registerPlugin(NativeBiometricAuthPlugin.class);
+                  registerPlugin(NativeExportPlugin.class);
+                  registerPlugin(CashNestGoogleAuthPlugin.class);
+                  registerPlugin(CashNestReceiptScannerPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVAFILE
+
+          if [ "$GOOGLE_BACKUP_NATIVE_ENABLED" = "true" ]; then
+            cat > "$JAVA_DIR/CashNestGoogleAuthPlugin.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import androidx.activity.result.ActivityResult;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.ActivityCallback;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.google.android.gms.auth.api.signin.GoogleSignIn;
+          import com.google.android.gms.auth.api.signin.GoogleSignInAccount;
+          import com.google.android.gms.auth.api.signin.GoogleSignInClient;
+          import com.google.android.gms.auth.api.signin.GoogleSignInOptions;
+          import com.google.android.gms.common.api.ApiException;
+
+          @CapacitorPlugin(name = "CashNestGoogle")
+          public class CashNestGoogleAuthPlugin extends Plugin {
+              private GoogleSignInClient signInClient;
+
+              @PluginMethod
+              public void signIn(PluginCall call) {
+                  String serverClientId = call.getString("serverClientId", "");
+                  if (serverClientId == null || serverClientId.trim().isEmpty()) {
+                      call.reject("Missing Firebase Web client ID. Add VITE_FIREBASE_WEB_CLIENT_ID to GitHub Secrets.");
+                      return;
+                  }
+                  GoogleSignInOptions options = new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+                      .requestEmail()
+                      .requestProfile()
+                      .requestIdToken(serverClientId)
+                      .build();
+                  signInClient = GoogleSignIn.getClient(getActivity(), options);
+                  startActivityForResult(call, signInClient.getSignInIntent(), "handleSignInResult");
+              }
+
+              @ActivityCallback
+              private void handleSignInResult(PluginCall call, ActivityResult result) {
+                  if (call == null) return;
+                  if (result == null || result.getResultCode() != Activity.RESULT_OK) {
+                      call.reject("Google sign-in cancelled.");
+                      return;
+                  }
+                  Intent data = result.getData();
+                  try {
+                      GoogleSignInAccount account = GoogleSignIn.getSignedInAccountFromIntent(data).getResult(ApiException.class);
+                      if (account == null) {
+                          call.reject("Google account is missing. Check Android OAuth package name and release SHA-1.");
+                          return;
+                      }
+                      String idToken = account.getIdToken();
+                      if (idToken == null || idToken.trim().isEmpty()) {
+                          call.reject("Google ID token missing. Add Android OAuth client with this package name and release SHA-1, then rebuild APK.");
+                          return;
+                      }
+
+                      JSObject auth = new JSObject();
+                      auth.put("idToken", idToken);
+
+                      JSObject profile = new JSObject();
+                      profile.put("name", account.getDisplayName() == null ? "Google User" : account.getDisplayName());
+                      profile.put("email", account.getEmail() == null ? "" : account.getEmail());
+                      profile.put("imageUrl", account.getPhotoUrl() == null ? "" : account.getPhotoUrl().toString());
+                      profile.put("id", account.getId() == null ? "" : account.getId());
+
+                      JSObject ret = new JSObject();
+                      ret.put("authentication", auth);
+                      ret.put("profile", profile);
+                      ret.put("idToken", idToken);
+                      ret.put("email", account.getEmail() == null ? "" : account.getEmail());
+                      call.resolve(ret);
+                  } catch (Exception error) {
+                      call.reject("Google sign-in failed: " + error.getMessage(), error);
+                  }
+              }
+
+              @PluginMethod
+              public void getAccessToken(PluginCall call) {
+                  call.reject("Firebase ID token refresh happens in the JavaScript Firebase service. Sign in again if the session expired.");
+              }
+
+              @PluginMethod
+              public void clearToken(PluginCall call) {
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void signOut(PluginCall call) {
+                  GoogleSignInClient client = signInClient;
+                  if (client == null) {
+                      client = GoogleSignIn.getClient(getActivity(), new GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN).build());
+                  }
+                  client.signOut()
+                      .addOnSuccessListener(unused -> call.resolve())
+                      .addOnFailureListener(error -> call.reject("Google sign-out failed: " + error.getMessage(), error));
+              }
+          }
+          JAVAFILE
+          else
+            cat > "$JAVA_DIR/CashNestGoogleAuthPlugin.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "CashNestGoogle")
+          public class CashNestGoogleAuthPlugin extends Plugin {
+              private static final String MESSAGE = "Firebase Google login is not configured. Ask the developer to add Firebase Auth secrets and rebuild the APK.";
+
+              @PluginMethod
+              public void signIn(PluginCall call) {
+                  call.reject(MESSAGE);
+              }
+
+              @PluginMethod
+              public void getAccessToken(PluginCall call) {
+                  call.reject(MESSAGE);
+              }
+
+              @PluginMethod
+              public void clearToken(PluginCall call) {
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void signOut(PluginCall call) {
+                  call.resolve();
+              }
+          }
+          JAVAFILE
+          fi
+
+          cat > "$JAVA_DIR/CashNestReceiptScannerPlugin.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.net.Uri;
+          import android.util.Base64;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.google.mlkit.vision.common.InputImage;
+          import com.google.mlkit.vision.text.Text;
+          import com.google.mlkit.vision.text.TextRecognition;
+          import com.google.mlkit.vision.text.TextRecognizer;
+          import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+          import java.io.InputStream;
+
+          @CapacitorPlugin(name = "CashNestReceiptScanner")
+          public class CashNestReceiptScannerPlugin extends Plugin {
+              @PluginMethod
+              public void scanReceipt(PluginCall call) {
+                  String imageDataUrl = call.getString("imageDataUrl", "");
+                  String path = call.getString("path", "");
+                  try {
+                      InputImage image = buildInputImage(imageDataUrl, path);
+                      TextRecognizer recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+                      recognizer.process(image)
+                              .addOnSuccessListener(result -> resolveText(call, result))
+                              .addOnFailureListener(error -> call.reject("Google ML Kit could not read this receipt photo: " + error.getMessage(), error));
+                  } catch (Exception error) {
+                      call.reject("Receipt photo could not be opened for ML Kit: " + error.getMessage(), error);
+                  }
+              }
+
+              private InputImage buildInputImage(String imageDataUrl, String path) throws Exception {
+                  if (imageDataUrl != null && imageDataUrl.trim().startsWith("data:image")) {
+                      String base64 = imageDataUrl.substring(imageDataUrl.indexOf(',') + 1);
+                      byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+                      Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                      if (bitmap == null) throw new Exception("Invalid receipt image data");
+                      return InputImage.fromBitmap(bitmap, 0);
+                  }
+
+                  if (path != null && !path.trim().isEmpty()) {
+                      Uri uri = Uri.parse(path);
+                      if (uri.getScheme() == null) uri = Uri.fromFile(new java.io.File(path));
+                      return InputImage.fromFilePath(getContext(), uri);
+                  }
+
+                  throw new Exception("Missing receipt image");
+              }
+
+              private void resolveText(PluginCall call, Text result) {
+                  JSObject ret = new JSObject();
+                  JSArray blocks = new JSArray();
+                  for (Text.TextBlock block : result.getTextBlocks()) {
+                      JSObject blockObj = new JSObject();
+                      blockObj.put("text", block.getText());
+                      if (block.getBoundingBox() != null) {
+                          JSObject box = new JSObject();
+                          box.put("left", block.getBoundingBox().left);
+                          box.put("top", block.getBoundingBox().top);
+                          box.put("right", block.getBoundingBox().right);
+                          box.put("bottom", block.getBoundingBox().bottom);
+                          blockObj.put("box", box);
+                      }
+                      blocks.put(blockObj);
+                  }
+                  ret.put("text", result.getText());
+                  ret.put("blocks", blocks);
+                  call.resolve(ret);
+              }
+          }
+          JAVAFILE
+
+
+
+          cat > "$JAVA_DIR/ApkInstallerPlugin.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import org.json.JSONObject;
+
+          @CapacitorPlugin(name = "ApkInstaller")
+          public class ApkInstallerPlugin extends Plugin {
+              @PluginMethod
+              public void installFromUrl(PluginCall call) {
+                  String url = call.getString("apiUrl", call.getString("url"));
+                  String fileName = call.getString("fileName", "CashNest-X-update.apk");
+                  String version = call.getString("version", "");
+                  JSONObject headers = call.getData().optJSONObject("headers");
+                  if (headers == null) headers = new JSONObject();
+                  long expectedSize = 0L;
+                  try {
+                      Object rawSize = call.getData().opt("size");
+                      if (rawSize instanceof Number) expectedSize = ((Number) rawSize).longValue();
+                  } catch (Exception ignored) {}
+
+                  if (url == null || url.trim().isEmpty()) {
+                      call.reject("Missing APK URL");
+                      return;
+                  }
+
+                  try {
+                      long id = CashNestApkUpdateHelper.enqueueDownload(getContext(), url, fileName, headers, true, expectedSize, version);
+                      JSObject ret = new JSObject();
+                      ret.put("queued", true);
+                      ret.put("downloadId", id);
+                      ret.put("message", "Download started. It will continue while the screen is off.");
+                      call.resolve(ret);
+                  } catch (Exception error) {
+                      call.reject("Failed to start APK download", error);
+                  }
+              }
+
+              @PluginMethod
+              public void showUpdateNotification(PluginCall call) {
+                  String url = call.getString("apiUrl", call.getString("url"));
+                  String fileName = call.getString("fileName", "CashNest-X-update.apk");
+                  String version = call.getString("version", "");
+                  JSONObject headers = call.getData().optJSONObject("headers");
+                  if (headers == null) headers = new JSONObject();
+                  long size = 0;
+                  try {
+                      Object rawSize = call.getData().opt("size");
+                      if (rawSize instanceof Number) size = ((Number) rawSize).longValue();
+                  } catch (Exception ignored) {}
+                  if (url == null || url.trim().isEmpty()) {
+                      call.reject("Missing APK URL");
+                      return;
+                  }
+                  CashNestApkUpdateHelper.showAvailable(getContext(), url, fileName, version, size, headers);
+                  JSObject ret = new JSObject();
+                  ret.put("shown", true);
+                  call.resolve(ret);
+              }
+
+              @PluginMethod
+              public void getDownloadState(PluginCall call) {
+                  call.resolve(CashNestApkUpdateHelper.getDownloadState(getContext()));
+              }
+
+              @PluginMethod
+              public void openDownloadedInstaller(PluginCall call) {
+                  try {
+                      CashNestApkUpdateHelper.openSavedInstaller(getContext());
+                      JSObject ret = new JSObject();
+                      ret.put("opened", true);
+                      call.resolve(ret);
+                  } catch (Exception error) {
+                      call.reject("Failed to open downloaded APK installer", error);
+                  }
+              }
+
+              @PluginMethod
+              public void cleanupInstalledDownload(PluginCall call) {
+                  String currentVersion = call.getString("currentVersion", "");
+                  CashNestApkUpdateHelper.cleanupInstalledDownload(getContext(), currentVersion);
+                  JSObject ret = new JSObject();
+                  ret.put("cleaned", true);
+                  call.resolve(ret);
+              }
+          }
+          JAVAFILE
+
+          cat > "$JAVA_DIR/CashNestUpdateActionReceiver.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import android.app.NotificationManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.app.DownloadManager;
+          import org.json.JSONObject;
+
+          public class CashNestUpdateActionReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (intent == null) return;
+                  String action = intent.getAction();
+                  if (DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(action)) {
+                      long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L);
+                      CashNestApkUpdateHelper.handleDownloadComplete(context, id);
+                      return;
+                  }
+                  if (CashNestApkUpdateHelper.ACTION_LATER.equals(action)) {
+                      NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) nm.cancel(CashNestApkUpdateHelper.NOTIFICATION_ID);
+                      return;
+                  }
+                  if (CashNestApkUpdateHelper.ACTION_OPEN_UPDATER.equals(action)) {
+                      CashNestApkUpdateHelper.openUpdater(context);
+                      return;
+                  }
+                  if (CashNestApkUpdateHelper.ACTION_DOWNLOAD.equals(action)) {
+                      String url = intent.getStringExtra("url");
+                      String fileName = intent.getStringExtra("fileName");
+                      String headersJson = intent.getStringExtra("headersJson");
+                      long expectedSize = intent.getLongExtra("expectedSize", 0L);
+                      String version = intent.getStringExtra("version");
+                      JSONObject headers = new JSONObject();
+                      try { if (headersJson != null && !headersJson.trim().isEmpty()) headers = new JSONObject(headersJson); } catch (Exception ignored) {}
+                      if (url != null && !url.trim().isEmpty()) {
+                          try { CashNestApkUpdateHelper.enqueueDownload(context, url, fileName == null ? "CashNest-X-update.apk" : fileName, headers, true, expectedSize, version == null ? "" : version); }
+                          catch (Exception error) { CashNestApkUpdateHelper.showError(context, error.getMessage()); }
+                      }
+                      return;
+                  }
+                  if (CashNestApkUpdateHelper.ACTION_INSTALL.equals(action)) {
+                      CashNestApkUpdateHelper.openSavedInstaller(context);
+                  }
+              }
+          }
+          JAVAFILE
+
+          cat > "$JAVA_DIR/CashNestApkUpdateHelper.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import android.app.DownloadManager;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.ClipData;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import androidx.core.app.NotificationCompat;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.JSObject;
+          import java.io.BufferedInputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.Iterator;
+          import org.json.JSONObject;
+
+          public class CashNestApkUpdateHelper {
+              public static final String CHANNEL_ID = "cashnest_x_update_progress";
+              public static final int NOTIFICATION_ID = 91045;
+              public static final String ACTION_DOWNLOAD = "__CASHNEST_PACKAGE__.UPDATE_DOWNLOAD";
+              public static final String ACTION_INSTALL = "__CASHNEST_PACKAGE__.UPDATE_INSTALL";
+              public static final String ACTION_LATER = "__CASHNEST_PACKAGE__.UPDATE_LATER";
+              public static final String ACTION_OPEN_UPDATER = "__CASHNEST_PACKAGE__.UPDATE_OPEN_UPDATER";
+              private static final String PREFS = "cashnest_x_update_download";
+              private static final String KEY_ID = "download_id";
+              private static final String KEY_FILE = "file_name";
+              private static final String KEY_PATH = "apk_path";
+              private static final String KEY_STATUS = "status";
+              private static final String KEY_EXPECTED_SIZE = "expected_size";
+              private static final String KEY_RECEIVED = "received_bytes";
+              private static final String KEY_TOTAL = "total_bytes";
+              private static final String KEY_VERSION = "version";
+              private static final String KEY_URL = "download_url";
+
+              public static void showAvailable(Context context, String url, String fileName, String version, long size, JSONObject headers) {
+                  ensureChannel(context);
+                  NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+
+                  String cleanVersion = version == null || version.trim().isEmpty() ? "new version" : "v" + version.replaceFirst("^[vV]", "");
+                  NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(getSmallIcon())
+                      .setLargeIcon(getLargeIcon(context))
+                      .setContentTitle("CashNest X update available")
+                      .setContentText(cleanVersion + " is ready. Tap Download to update.")
+                      .setStyle(new NotificationCompat.BigTextStyle().bigText(cleanVersion + " is ready. Download continues when the screen is off."))
+                      .setCategory(NotificationCompat.CATEGORY_STATUS)
+                      .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setOngoing(false)
+                      .setAutoCancel(true)
+                      .setContentIntent(openUpdaterIntent(context))
+                      .addAction(android.R.drawable.stat_sys_download, "Download", downloadIntent(context, url, fileName, headers, size, version))
+                      .addAction(android.R.drawable.ic_menu_view, "Open", openUpdaterIntent(context))
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Later", laterIntent(context));
+                  nm.notify(NOTIFICATION_ID, builder.build());
+              }
+
+              public static long enqueueDownload(Context context, String url, String fileName, JSONObject headers, boolean showStartNotification, long expectedSize, String version) throws Exception {
+                  ensureChannel(context);
+                  DownloadManager dm = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
+                  if (dm == null) throw new Exception("Android DownloadManager is not available");
+                  String cleanName = sanitizeFileName(fileName == null || fileName.trim().isEmpty() ? "CashNest-X-update.apk" : fileName);
+                  File dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                  if (dir == null) dir = context.getCacheDir();
+                  if (!dir.exists()) dir.mkdirs();
+                  deleteOldCashNestApks(dir, cleanName);
+                  File target = new File(dir, cleanName);
+                  if (target.exists()) target.delete();
+
+                  // DownloadManager keeps custom headers during redirects. GitHub private
+                  // release assets redirect from api.github.com to a signed storage URL;
+                  // sending the GitHub Authorization header to that signed URL can make
+                  // Android report HTTP 400. For private GitHub asset API URLs we use
+                  // our own small downloader, strip auth after the GitHub redirect, and
+                  // keep the same progress/install notifications.
+                  if (isGitHubApiAssetUrl(url)) {
+                      long id = System.currentTimeMillis();
+                      prefs(context).edit()
+                          .putLong(KEY_ID, id)
+                          .putString(KEY_FILE, cleanName)
+                          .putString(KEY_PATH, target.getAbsolutePath())
+                          .putLong(KEY_EXPECTED_SIZE, Math.max(0L, expectedSize))
+                          .putLong(KEY_RECEIVED, 0L)
+                          .putLong(KEY_TOTAL, Math.max(0L, expectedSize))
+                          .putString(KEY_VERSION, cleanVersion(version))
+                          .putString(KEY_URL, url)
+                          .putString(KEY_STATUS, "downloading")
+                          .apply();
+                      if (showStartNotification) showDownloading(context, 0, expectedSize);
+                      startPrivateGitHubDownload(context.getApplicationContext(), url, target, headers, expectedSize, id);
+                      return id;
+                  }
+
+                  DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+                  request.setTitle("Downloading CashNest X update");
+                  request.setDescription("Download continues while the screen is off");
+                  request.setMimeType("application/vnd.android.package-archive");
+                  request.setAllowedOverMetered(true);
+                  request.setAllowedOverRoaming(true);
+                  request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
+                  request.setDestinationUri(Uri.fromFile(target));
+                  applyHeaders(request, headers, url);
+                  long id = dm.enqueue(request);
+                  prefs(context).edit()
+                      .putLong(KEY_ID, id)
+                      .putString(KEY_FILE, cleanName)
+                      .putString(KEY_PATH, target.getAbsolutePath())
+                      .putLong(KEY_EXPECTED_SIZE, Math.max(0L, expectedSize))
+                      .putLong(KEY_RECEIVED, 0L)
+                      .putLong(KEY_TOTAL, Math.max(0L, expectedSize))
+                      .putString(KEY_VERSION, cleanVersion(version))
+                      .putString(KEY_URL, url)
+                      .putString(KEY_STATUS, "downloading")
+                      .apply();
+                  if (showStartNotification) showDownloading(context, 0, expectedSize);
+                  return id;
+              }
+
+              public static JSObject getDownloadState(Context context) {
+                  JSObject ret = new JSObject();
+                  long id = prefs(context).getLong(KEY_ID, -1L);
+                  String path = prefs(context).getString(KEY_PATH, "");
+                  String fileName = prefs(context).getString(KEY_FILE, "");
+                  String savedVersion = prefs(context).getString(KEY_VERSION, "");
+                  String savedUrl = prefs(context).getString(KEY_URL, "");
+                  String statusText = prefs(context).getString(KEY_STATUS, "idle");
+                  long expectedSize = prefs(context).getLong(KEY_EXPECTED_SIZE, 0L);
+                  long savedReceived = prefs(context).getLong(KEY_RECEIVED, 0L);
+                  long savedTotal = Math.max(prefs(context).getLong(KEY_TOTAL, 0L), expectedSize);
+                  ret.put("downloadId", id);
+                  ret.put("filePath", path);
+                  ret.put("fileName", fileName);
+                  ret.put("version", savedVersion == null ? "" : savedVersion);
+                  ret.put("url", savedUrl == null ? "" : savedUrl);
+                  ret.put("status", statusText);
+                  ret.put("received", savedReceived);
+                  ret.put("total", savedTotal > 0 ? savedTotal : 0);
+                  ret.put("percent", savedTotal > 0 ? Math.min(100, (savedReceived * 100.0) / savedTotal) : 0);
+                  if (expectedSize > 0) ret.put("expectedSize", expectedSize);
+                  if (id <= 0) return ret;
+
+                  DownloadManager dm = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
+                  if (dm == null) return ret;
+                  Cursor cursor = null;
+                  try {
+                      cursor = dm.query(new DownloadManager.Query().setFilterById(id));
+                      if (cursor != null && cursor.moveToFirst()) {
+                          int status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                          long received = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                          long reportedTotal = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                          long total = Math.max(Math.max(reportedTotal, expectedSize), received);
+                          ret.put("received", received);
+                          ret.put("total", total > 0 ? total : 0);
+                          ret.put("percent", total > 0 ? Math.min(100, (received * 100.0) / total) : 0);
+                          prefs(context).edit().putLong(KEY_RECEIVED, received).putLong(KEY_TOTAL, total > 0 ? total : 0).apply();
+                          if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                              ret.put("status", "complete");
+                              prefs(context).edit().putString(KEY_STATUS, "complete").apply();
+                          } else if (status == DownloadManager.STATUS_FAILED) {
+                              int reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+                              ret.put("reason", reason);
+                              ret.put("status", "error");
+                              prefs(context).edit().putString(KEY_STATUS, "error").apply();
+                          } else if (status == DownloadManager.STATUS_PAUSED) {
+                              ret.put("status", "paused");
+                          } else if (status == DownloadManager.STATUS_PENDING) {
+                              ret.put("status", "pending");
+                          } else {
+                              ret.put("status", "downloading");
+                          }
+                      }
+                  } catch (Exception ignored) {
+                  } finally {
+                      if (cursor != null) cursor.close();
+                  }
+                  return ret;
+              }
+
+              public static void handleDownloadComplete(Context context, long id) {
+                  long savedId = prefs(context).getLong(KEY_ID, -1L);
+                  if (id <= 0 || id != savedId) return;
+                  JSObject state = getDownloadState(context);
+                  String status = state.optString("status", "");
+                  if ("complete".equals(status)) {
+                      File apk = getSavedApk(context);
+                      long expectedSize = prefs(context).getLong(KEY_EXPECTED_SIZE, 0L);
+                      if (!looksLikeApk(apk, expectedSize)) {
+                          prefs(context).edit().putString(KEY_STATUS, "error").apply();
+                          showError(context, "Downloaded file is not the real APK. Check the private repo token and asset URL.");
+                          return;
+                      }
+                      prefs(context).edit().putString(KEY_STATUS, "complete").apply();
+                      showComplete(context, apk);
+                  } else if ("error".equals(status)) {
+                      int reason = 0;
+                      try { reason = state.optInt("reason", 0); } catch (Exception ignored) {}
+                      showError(context, reason > 0 ? "Download failed (" + reason + "). Check token permission and network." : "Download failed. Check token permission and network.");
+                  }
+              }
+
+              private static boolean isGitHubApiAssetUrl(String url) {
+                  return url != null
+                      && url.startsWith("https://api.github.com/repos/")
+                      && url.contains("/releases/assets/");
+              }
+
+              private static void startPrivateGitHubDownload(final Context context, final String url, final File target, final JSONObject headers, final long expectedSize, final long id) {
+                  new Thread(() -> {
+                      try {
+                          downloadPrivateGitHubAsset(context, url, target, headers, expectedSize, id);
+                      } catch (Exception error) {
+                          prefs(context).edit().putString(KEY_STATUS, "error").apply();
+                          showError(context, error.getMessage() == null ? "Download failed. Check token permission and network." : error.getMessage());
+                      }
+                  }, "CashNestXPrivateApkDownload").start();
+              }
+
+              private static void downloadPrivateGitHubAsset(Context context, String url, File target, JSONObject headers, long expectedSize, long id) throws Exception {
+                  File part = new File(target.getAbsolutePath() + ".part");
+                  if (part.exists()) part.delete();
+                  if (target.exists()) target.delete();
+
+                  HttpURLConnection connection = openGitHubConnection(url, headers);
+                  int code = connection.getResponseCode();
+                  if (code < 200 || code >= 300) {
+                      connection.disconnect();
+                      throw new Exception("Download failed (" + code + "). Check token permission and network.");
+                  }
+
+                  long contentLength = connection.getContentLengthLong();
+                  long total = Math.max(Math.max(contentLength, expectedSize), 0L);
+                  prefs(context).edit().putLong(KEY_TOTAL, total).putString(KEY_STATUS, "downloading").apply();
+
+                  byte[] buffer = new byte[64 * 1024];
+                  long received = 0L;
+                  long lastNotify = 0L;
+                  BufferedInputStream input = new BufferedInputStream(connection.getInputStream());
+                  FileOutputStream output = new FileOutputStream(part);
+                  try {
+                      int read;
+                      while ((read = input.read(buffer)) != -1) {
+                          output.write(buffer, 0, read);
+                          received += read;
+                          long now = System.currentTimeMillis();
+                          if (now - lastNotify > 900 || received >= total) {
+                              lastNotify = now;
+                              prefs(context).edit()
+                                  .putLong(KEY_RECEIVED, received)
+                                  .putLong(KEY_TOTAL, Math.max(total, received))
+                                  .putString(KEY_STATUS, "downloading")
+                                  .apply();
+                              showDownloading(context, received, Math.max(total, received));
+                          }
+                      }
+                  } finally {
+                      try { output.close(); } catch (Exception ignored) {}
+                      try { input.close(); } catch (Exception ignored) {}
+                      connection.disconnect();
+                  }
+
+                  if (!part.renameTo(target)) {
+                      throw new Exception("Could not save downloaded APK.");
+                  }
+
+                  prefs(context).edit()
+                      .putLong(KEY_RECEIVED, target.length())
+                      .putLong(KEY_TOTAL, Math.max(Math.max(total, expectedSize), target.length()))
+                      .putString(KEY_STATUS, "complete")
+                      .apply();
+
+                  if (!looksLikeApk(target, expectedSize)) {
+                      prefs(context).edit().putString(KEY_STATUS, "error").apply();
+                      showError(context, "Downloaded file is not the real APK. Check the private repo token and asset URL.");
+                      return;
+                  }
+                  showComplete(context, target);
+              }
+
+              private static HttpURLConnection openGitHubConnection(String url, JSONObject headers) throws Exception {
+                  URL current = new URL(url);
+                  for (int redirect = 0; redirect < 8; redirect++) {
+                      HttpURLConnection connection = (HttpURLConnection) current.openConnection();
+                      connection.setInstanceFollowRedirects(false);
+                      connection.setConnectTimeout(30000);
+                      connection.setReadTimeout(30000);
+                      connection.setRequestMethod("GET");
+                      applyManualHeaders(connection, headers, "api.github.com".equalsIgnoreCase(current.getHost()));
+                      int code = connection.getResponseCode();
+                      if (code == HttpURLConnection.HTTP_MOVED_PERM
+                          || code == HttpURLConnection.HTTP_MOVED_TEMP
+                          || code == HttpURLConnection.HTTP_SEE_OTHER
+                          || code == 307
+                          || code == 308) {
+                          String location = connection.getHeaderField("Location");
+                          connection.disconnect();
+                          if (location == null || location.trim().isEmpty()) throw new Exception("GitHub asset redirect missing download location.");
+                          current = new URL(current, location);
+                          continue;
+                      }
+                      return connection;
+                  }
+                  throw new Exception("Too many GitHub asset redirects.");
+              }
+
+              private static void applyManualHeaders(HttpURLConnection connection, JSONObject headers, boolean githubApiHost) {
+                  connection.setRequestProperty("User-Agent", "CashNest-X-Android-Updater");
+                  connection.setRequestProperty("Accept", githubApiHost ? "application/octet-stream" : "application/octet-stream");
+                  if (githubApiHost) connection.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
+                  if (headers == null) return;
+                  Iterator<String> keys = headers.keys();
+                  while (keys.hasNext()) {
+                      String key = keys.next();
+                      if (key == null) continue;
+                      if (!githubApiHost && ("authorization".equalsIgnoreCase(key) || "x-github-api-version".equalsIgnoreCase(key))) continue;
+                      String value = headers.optString(key, "");
+                      if (value != null && !value.trim().isEmpty()) connection.setRequestProperty(key, value);
+                  }
+              }
+
+              private static void showDownloading(Context context, long received, long total) {
+                  NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  int percent = total > 0 ? (int) Math.min(100, (received * 100) / total) : 0;
+                  NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(getSmallIcon())
+                      .setLargeIcon(getLargeIcon(context))
+                      .setContentTitle("Downloading CashNest X update")
+                      .setContentText(total > 0 ? percent + "% downloaded" : "Download continues in background")
+                      .setSubText(total > 0 ? percent + "%" : "Downloading")
+                      .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+                      .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setOngoing(true)
+                      .setAutoCancel(false)
+                      .setOnlyAlertOnce(true)
+                      .setSilent(true)
+                      .setProgress(total > 0 ? 100 : 100, total > 0 ? percent : 0, total <= 0)
+                      .setContentIntent(openUpdaterIntent(context))
+                      .addAction(android.R.drawable.ic_menu_view, "Open", openUpdaterIntent(context))
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Later", laterIntent(context));
+                  nm.notify(NOTIFICATION_ID, builder.build());
+              }
+
+              private static void showComplete(Context context, File apk) {
+                  NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  PendingIntent installPendingIntent = installIntent(context, apk);
+                  NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(getSmallIcon())
+                      .setLargeIcon(getLargeIcon(context))
+                      .setContentTitle("CashNest X update downloaded")
+                      .setContentText("Tap Install to update now.")
+                      .setStyle(new NotificationCompat.BigTextStyle().bigText("Download complete in background. Tap Install to open the APK installer."))
+                      .setCategory(NotificationCompat.CATEGORY_STATUS)
+                      .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setOngoing(false)
+                      .setAutoCancel(true)
+                      .setContentIntent(installPendingIntent)
+                      .setProgress(0, 0, false)
+                      .addAction(android.R.drawable.stat_sys_download_done, "Install", installPendingIntent)
+                      .addAction(android.R.drawable.ic_menu_view, "Open updater", openUpdaterIntent(context))
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Later", laterIntent(context));
+                  nm.notify(NOTIFICATION_ID, builder.build());
+              }
+
+              public static void showError(Context context, String message) {
+                  ensureChannel(context);
+                  NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  NotificationCompat.Builder builder = new NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(getSmallIcon())
+                      .setLargeIcon(getLargeIcon(context))
+                      .setContentTitle("CashNest X update failed")
+                      .setContentText(message == null ? "Download failed" : message)
+                      .setStyle(new NotificationCompat.BigTextStyle().bigText(message == null ? "Download failed" : message))
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setOngoing(false)
+                      .setContentIntent(openUpdaterIntent(context))
+                      .addAction(android.R.drawable.ic_menu_view, "Open updater", openUpdaterIntent(context))
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Later", laterIntent(context));
+                  nm.notify(NOTIFICATION_ID, builder.build());
+              }
+
+              public static void cleanupInstalledDownload(Context context, String currentVersion) {
+                  String savedVersion = prefs(context).getString(KEY_VERSION, "");
+                  File apk = getSavedApk(context);
+                  boolean installedOrOlder = !savedVersion.trim().isEmpty()
+                      && !cleanVersion(currentVersion).trim().isEmpty()
+                      && compareVersions(savedVersion, currentVersion) <= 0;
+                  if (installedOrOlder) {
+                      try { if (apk != null && apk.exists()) apk.delete(); } catch (Exception ignored) {}
+                      prefs(context).edit().clear().apply();
+                      NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) nm.cancel(NOTIFICATION_ID);
+                  }
+              }
+
+              private static String cleanVersion(String value) {
+                  if (value == null) return "";
+                  String out = value.trim().replaceFirst("^[vV]", "");
+                  int dash = out.indexOf('-');
+                  if (dash >= 0) out = out.substring(0, dash);
+                  return out;
+              }
+
+              private static int compareVersions(String left, String right) {
+                  String[] a = cleanVersion(left).split("\\.");
+                  String[] b = cleanVersion(right).split("\\.");
+                  int len = Math.max(Math.max(a.length, b.length), 3);
+                  for (int i = 0; i < len; i++) {
+                      int av = i < a.length ? parseVersionPart(a[i]) : 0;
+                      int bv = i < b.length ? parseVersionPart(b[i]) : 0;
+                      if (av > bv) return 1;
+                      if (av < bv) return -1;
+                  }
+                  return 0;
+              }
+
+              private static int parseVersionPart(String value) {
+                  try { return Integer.parseInt(value.replaceAll("[^0-9].*$", "")); }
+                  catch (Exception ignored) { return 0; }
+              }
+
+              private static boolean looksLikeApk(File apk, long expectedSize) {
+                  try {
+                      if (apk == null || !apk.exists() || apk.length() < 1024 * 1024) return false;
+                      if (expectedSize > 1024 * 1024 && apk.length() < (long) (expectedSize * 0.90)) return false;
+                      java.io.FileInputStream input = new java.io.FileInputStream(apk);
+                      try {
+                          int first = input.read();
+                          int second = input.read();
+                          return first == 'P' && second == 'K';
+                      } finally {
+                          input.close();
+                      }
+                  } catch (Exception ignored) {
+                      return false;
+                  }
+              }
+
+              private static void applyHeaders(DownloadManager.Request request, JSONObject headers, String currentUrl) {
+                  boolean hasAccept = false;
+                  boolean hasUserAgent = false;
+                  if (headers != null) {
+                      Iterator<String> scanKeys = headers.keys();
+                      while (scanKeys.hasNext()) {
+                          String scanKey = scanKeys.next();
+                          if ("accept".equalsIgnoreCase(scanKey)) hasAccept = true;
+                          if ("user-agent".equalsIgnoreCase(scanKey)) hasUserAgent = true;
+                      }
+                  }
+                  if (!hasUserAgent) request.addRequestHeader("User-Agent", "CashNest-X-Android-Updater");
+                  if (!hasAccept) request.addRequestHeader("Accept", "application/octet-stream");
+                  request.addRequestHeader("X-GitHub-Api-Version", "2022-11-28");
+                  if (headers == null) return;
+                  Iterator<String> keys = headers.keys();
+                  while (keys.hasNext()) {
+                      String key = keys.next();
+                      if (key == null) continue;
+                      String value = headers.optString(key, "");
+                      if (value != null && !value.trim().isEmpty()) request.addRequestHeader(key, value);
+                  }
+              }
+
+              private static PendingIntent downloadIntent(Context context, String url, String fileName, JSONObject headers, long expectedSize, String version) {
+                  Intent intent = new Intent(context, CashNestUpdateActionReceiver.class);
+                  intent.setAction(ACTION_DOWNLOAD);
+                  intent.putExtra("url", url);
+                  intent.putExtra("fileName", fileName);
+                  intent.putExtra("headersJson", headers == null ? "{}" : headers.toString());
+                  intent.putExtra("expectedSize", expectedSize);
+                  intent.putExtra("version", cleanVersion(version));
+                  return PendingIntent.getBroadcast(context, 91046, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              private static PendingIntent laterIntent(Context context) {
+                  Intent intent = new Intent(context, CashNestUpdateActionReceiver.class);
+                  intent.setAction(ACTION_LATER);
+                  return PendingIntent.getBroadcast(context, 91047, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              private static PendingIntent openUpdaterIntent(Context context) {
+                  return PendingIntent.getActivity(context, 91049, buildOpenUpdaterIntent(context), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              private static Intent buildOpenUpdaterIntent(Context context) {
+                  Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
+                  if (intent == null) {
+                      intent = new Intent(Intent.ACTION_VIEW, Uri.parse("cashnest_x://updates"));
+                  } else {
+                      intent.setAction(Intent.ACTION_VIEW);
+                      intent.setData(Uri.parse("cashnest_x://updates"));
+                  }
+                  intent.putExtra("cashnest_xScreen", "updates");
+                  intent.putExtra("cashnest_xOpenUpdater", true);
+                  intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  return intent;
+              }
+
+              private static PendingIntent installIntent(Context context, File apk) {
+                  Intent intent = buildInstallIntent(context, apk);
+                  return PendingIntent.getActivity(context, 91048, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              private static Intent buildInstallIntent(Context context, File apk) {
+                  Uri uri = FileProvider.getUriForFile(context, context.getPackageName() + ".fileprovider", apk);
+                  Intent intent = new Intent(Intent.ACTION_INSTALL_PACKAGE);
+                  intent.setDataAndType(uri, "application/vnd.android.package-archive");
+                  intent.setClipData(ClipData.newRawUri("CashNest X update", uri));
+                  intent.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
+                  intent.putExtra(Intent.EXTRA_RETURN_RESULT, false);
+                  intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  return intent;
+              }
+
+              public static void openSavedInstaller(Context context) {
+                  File apk = getSavedApk(context);
+                  long expectedSize = prefs(context).getLong(KEY_EXPECTED_SIZE, 0L);
+                  if (looksLikeApk(apk, expectedSize)) openInstaller(context, apk);
+                  else {
+                      prefs(context).edit().putString(KEY_STATUS, "error").apply();
+                      showError(context, "Downloaded APK is incomplete. Download the update again.");
+                  }
+              }
+
+              public static void openInstaller(Context context, File apk) {
+                  context.startActivity(buildInstallIntent(context, apk));
+              }
+
+              public static void openUpdater(Context context) {
+                  context.startActivity(buildOpenUpdaterIntent(context));
+              }
+
+              private static File getSavedApk(Context context) {
+                  String path = prefs(context).getString(KEY_PATH, "");
+                  if (path != null && !path.trim().isEmpty()) return new File(path);
+                  String name = prefs(context).getString(KEY_FILE, "CashNest-X-update.apk");
+                  File dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                  if (dir == null) dir = context.getCacheDir();
+                  return new File(dir, name);
+              }
+
+              private static void deleteOldCashNestApks(File dir, String keepName) {
+                  try {
+                      if (dir == null || !dir.exists()) return;
+                      File[] files = dir.listFiles();
+                      if (files == null) return;
+                      for (File file : files) {
+                          String name = file.getName();
+                          if (name == null) continue;
+                          boolean cashNestApk = name.toLowerCase().endsWith(".apk") && name.toLowerCase().contains("cashnest_x");
+                          boolean partial = name.toLowerCase().contains("cashnest_x") && name.toLowerCase().endsWith(".apk.part");
+                          if ((cashNestApk || partial) && !name.equals(keepName)) {
+                              try { file.delete(); } catch (Exception ignored) {}
+                          }
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              private static SharedPreferences prefs(Context context) {
+                  return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              private static String sanitizeFileName(String name) {
+                  return name.replaceAll("[^A-Za-z0-9._-]", "_");
+              }
+
+              private static void ensureChannel(Context context) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+                  NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "CashNest X update progress", NotificationManager.IMPORTANCE_HIGH);
+                  channel.setDescription("Shows CashNest X APK update download, updater, install and later actions");
+                  channel.setShowBadge(false);
+                  nm.createNotificationChannel(channel);
+              }
+
+              private static Bitmap getLargeIcon(Context context) {
+                  try {
+                      return BitmapFactory.decodeResource(context.getResources(), R.drawable.ic_cashnest_x_notification_large);
+                  } catch (Exception ignored) {
+                      return null;
+                  }
+              }
+
+              private static int getSmallIcon() {
+                  return R.drawable.ic_stat_cashnest_x_notification;
+              }
+          }
+          JAVAFILE
+
+          cat > "$JAVA_DIR/NativeExportPlugin.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import android.content.ActivityNotFoundException;
+          import android.content.ContentResolver;
+          import android.content.ContentUris;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.MimeTypeMap;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          @CapacitorPlugin(name = "NativeExport")
+          public class NativeExportPlugin extends Plugin {
+              @PluginMethod
+              public void saveFile(PluginCall call) {
+                  String fileName = call.getString("fileName", "CashNest-X-export.txt");
+                  String mimeType = call.getString("mimeType", "application/octet-stream");
+                  String base64Data = call.getString("base64Data");
+                  String directory = call.getString("directory", "Downloads");
+                  String folder = call.getString("folder", "CashNest X");
+                  Boolean replaceExisting = call.getBoolean("replaceExisting", false);
+
+                  if (base64Data == null || base64Data.trim().isEmpty()) {
+                      call.reject("Missing export data");
+                      return;
+                  }
+
+                  try {
+                      byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                      JSObject saved = saveToPublicFolder(directory, folder, fileName, mimeType, bytes, replaceExisting != null && replaceExisting.booleanValue());
+                      saved.put("saved", true);
+                      saved.put("fileName", fileName);
+                      saved.put("size", bytes.length);
+                      call.resolve(saved);
+                  } catch (Exception e) {
+                      call.reject("Failed to save export file", e);
+                  }
+              }
+
+              @PluginMethod
+              public void saveLocalBackup(PluginCall call) {
+                  String fileName = call.getString("fileName", "CashNest-X-auto-local-backup.cnbak");
+                  String mimeType = call.getString("mimeType", "application/octet-stream");
+                  String base64Data = call.getString("base64Data");
+                  String directory = call.getString("directory", "Documents");
+                  String folder = call.getString("folder", "CashNest X");
+                  Boolean replaceExisting = call.getBoolean("replaceExisting", true);
+
+                  if (base64Data == null || base64Data.trim().isEmpty()) {
+                      call.reject("Missing backup data");
+                      return;
+                  }
+
+                  try {
+                      byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                      JSObject saved = saveToPublicFolder(directory, folder, fileName, mimeType, bytes, replaceExisting == null || replaceExisting.booleanValue());
+                      saved.put("saved", true);
+                      saved.put("method", "android-documents");
+                      saved.put("fileName", fileName);
+                      saved.put("size", bytes.length);
+                      call.resolve(saved);
+                  } catch (Exception e) {
+                      call.reject("Failed to save local backup", e);
+                  }
+              }
+
+              @PluginMethod
+              public void readLocalBackup(PluginCall call) {
+                  String fileName = call.getString("fileName", "CashNest-X-auto-local-backup.cnbak");
+                  String directory = call.getString("directory", "Documents");
+                  String folder = call.getString("folder", "CashNest X");
+
+                  try {
+                      JSObject publicBackup = readFromPublicFolder(directory, folder, fileName);
+                      if (publicBackup != null) {
+                          call.resolve(publicBackup);
+                          return;
+                      }
+
+                      File dir = new File(getContext().getFilesDir(), "CashNestXBackups");
+                      File file = new File(dir, fileName);
+                      if (!file.exists()) {
+                          call.reject("No automatic local backup found");
+                          return;
+                      }
+                      byte[] bytes = readAllBytes(new FileInputStream(file));
+
+                      JSObject ret = new JSObject();
+                      ret.put("found", true);
+                      ret.put("method", "android-app-storage-legacy");
+                      ret.put("fileName", fileName);
+                      ret.put("path", file.getAbsolutePath());
+                      ret.put("folder", "App storage/CashNestXBackups");
+                      ret.put("size", bytes.length);
+                      ret.put("base64Data", Base64.encodeToString(bytes, Base64.NO_WRAP));
+                      call.resolve(ret);
+                  } catch (Exception e) {
+                      call.reject("Failed to read local backup", e);
+                  }
+              }
+
+              @PluginMethod
+              public void openFile(PluginCall call) {
+                  String uriText = call.getString("uri", "");
+                  String path = call.getString("path", "");
+                  String fileName = call.getString("fileName", "");
+                  String mimeType = call.getString("mimeType", "application/octet-stream");
+
+                  try {
+                      Uri uri = null;
+                      if (uriText != null && !uriText.trim().isEmpty()) {
+                          uri = Uri.parse(uriText);
+                      } else if (path != null && !path.trim().isEmpty() && path.startsWith("/")) {
+                          File file = new File(path);
+                          uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", file);
+                      }
+
+                      if (uri == null) {
+                          openDownloadsFolder(call);
+                          return;
+                      }
+
+                      if (mimeType == null || mimeType.trim().isEmpty() || "application/octet-stream".equals(mimeType)) {
+                          String ext = MimeTypeMap.getFileExtensionFromUrl(fileName == null ? "" : fileName);
+                          String guessed = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext == null ? "" : ext.toLowerCase());
+                          if (guessed != null) mimeType = guessed;
+                      }
+
+                      Intent intent = new Intent(Intent.ACTION_VIEW);
+                      intent.setDataAndType(uri, mimeType);
+                      intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(intent);
+
+                      JSObject ret = new JSObject();
+                      ret.put("opened", true);
+                      ret.put("target", "file");
+                      call.resolve(ret);
+                  } catch (ActivityNotFoundException noApp) {
+                      openDownloadsFolder(call);
+                  } catch (Exception e) {
+                      call.reject("Failed to open export file", e);
+                  }
+              }
+
+              @PluginMethod
+              public void openDownloadsFolder(PluginCall call) {
+                  String directory = call.getString("directory", "Downloads");
+                  boolean documents = directory != null && "Documents".equalsIgnoreCase(directory.trim());
+                  try {
+                      Intent intent = new Intent(Intent.ACTION_VIEW);
+                      String root = documents ? "documents" : "downloads";
+                      intent.setDataAndType(Uri.parse("content://com.android.providers.downloads.documents/root/" + root), "vnd.android.document/root");
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(intent);
+
+                      JSObject ret = new JSObject();
+                      ret.put("opened", true);
+                      ret.put("target", documents ? "documents" : "downloads");
+                      call.resolve(ret);
+                  } catch (Exception first) {
+                      try {
+                          Intent intent = new Intent(documents ? "android.intent.action.OPEN_DOCUMENT" : "android.intent.action.VIEW_DOWNLOADS");
+                          intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          getContext().startActivity(intent);
+
+                          JSObject ret = new JSObject();
+                          ret.put("opened", true);
+                          ret.put("target", documents ? "documents" : "downloads");
+                          call.resolve(ret);
+                      } catch (Exception second) {
+                          call.reject(documents ? "Failed to open Documents folder" : "Failed to open Downloads folder", second);
+                      }
+                  }
+              }
+
+              private JSObject saveToPublicFolder(String directoryName, String folderName, String fileName, String mimeType, byte[] bytes, boolean replaceExisting) throws Exception {
+                  String publicDir = normalizePublicDirectory(directoryName);
+                  String safeFolder = (folderName == null || folderName.trim().isEmpty()) ? "CashNest X" : folderName.trim();
+                  String relativePath = publicDir + "/" + safeFolder + "/";
+                  String folderLabel = publicDir + "/" + safeFolder;
+                  JSObject ret = new JSObject();
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      ContentResolver resolver = getContext().getContentResolver();
+                      Uri collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                      int deleted = replaceExisting ? deleteExistingPublicFiles(resolver, collection, relativePath, fileName) : 0;
+
+                      ContentValues values = new ContentValues();
+                      values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                      values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+                      values.put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath);
+                      values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                      Uri uri = resolver.insert(collection, values);
+                      if (uri == null) throw new Exception("Could not create " + folderLabel + " file");
+
+                      try (OutputStream out = resolver.openOutputStream(uri)) {
+                          if (out == null) throw new Exception("Could not open " + folderLabel + " file");
+                          out.write(bytes);
+                          out.flush();
+                      }
+
+                      values.clear();
+                      values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                      resolver.update(uri, values, null, null);
+                      ret.put("uri", uri.toString());
+                      ret.put("path", folderLabel + "/" + fileName);
+                      ret.put("folder", folderLabel);
+                      ret.put("method", "Documents".equals(publicDir) ? "android-documents" : "android-downloads");
+                      ret.put("replaced", deleted > 0);
+                      return ret;
+                  }
+
+                  File dir = new File(Environment.getExternalStoragePublicDirectory(publicDir), safeFolder);
+                  if (!dir.exists() && !dir.mkdirs()) throw new Exception("Could not create " + folderLabel);
+                  File file = new File(dir, fileName);
+                  boolean replaced = false;
+                  if (replaceExisting && file.exists()) {
+                      replaced = file.delete();
+                  }
+                  try (FileOutputStream out = new FileOutputStream(file, false)) {
+                      out.write(bytes);
+                      out.flush();
+                  }
+                  ret.put("path", file.getAbsolutePath());
+                  ret.put("folder", folderLabel);
+                  ret.put("method", "Documents".equals(publicDir) ? "android-documents" : "android-downloads");
+                  ret.put("replaced", replaced);
+                  return ret;
+              }
+
+              private JSObject readFromPublicFolder(String directoryName, String folderName, String fileName) throws Exception {
+                  String publicDir = normalizePublicDirectory(directoryName);
+                  String safeFolder = (folderName == null || folderName.trim().isEmpty()) ? "CashNest X" : folderName.trim();
+                  String relativePath = publicDir + "/" + safeFolder + "/";
+                  String folderLabel = publicDir + "/" + safeFolder;
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      ContentResolver resolver = getContext().getContentResolver();
+                      Uri collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                      String[] projection = new String[] { MediaStore.MediaColumns._ID, MediaStore.MediaColumns.SIZE };
+                      String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + "=?";
+                      String[] args = new String[] { fileName, relativePath };
+                      try (Cursor cursor = resolver.query(collection, projection, selection, args, MediaStore.MediaColumns.DATE_MODIFIED + " DESC")) {
+                          if (cursor == null || !cursor.moveToFirst()) return null;
+                          long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID));
+                          Uri uri = ContentUris.withAppendedId(collection, id);
+                          byte[] bytes = readAllBytes(resolver.openInputStream(uri));
+                          JSObject ret = new JSObject();
+                          ret.put("found", true);
+                          ret.put("method", "android-documents" );
+                          ret.put("fileName", fileName);
+                          ret.put("uri", uri.toString());
+                          ret.put("path", folderLabel + "/" + fileName);
+                          ret.put("folder", folderLabel);
+                          ret.put("size", bytes.length);
+                          ret.put("base64Data", Base64.encodeToString(bytes, Base64.NO_WRAP));
+                          return ret;
+                      }
+                  }
+
+                  File dir = new File(Environment.getExternalStoragePublicDirectory(publicDir), safeFolder);
+                  File file = new File(dir, fileName);
+                  if (!file.exists()) return null;
+                  byte[] bytes = readAllBytes(new FileInputStream(file));
+                  JSObject ret = new JSObject();
+                  ret.put("found", true);
+                  ret.put("method", "android-documents");
+                  ret.put("fileName", fileName);
+                  ret.put("path", file.getAbsolutePath());
+                  ret.put("folder", folderLabel);
+                  ret.put("size", bytes.length);
+                  ret.put("base64Data", Base64.encodeToString(bytes, Base64.NO_WRAP));
+                  return ret;
+              }
+
+              private int deleteExistingPublicFiles(ContentResolver resolver, Uri collection, String relativePath, String fileName) {
+                  int deleted = 0;
+                  String[] projection = new String[] { MediaStore.MediaColumns._ID };
+                  String selection = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND " + MediaStore.MediaColumns.RELATIVE_PATH + "=?";
+                  String[] args = new String[] { fileName, relativePath };
+                  try (Cursor cursor = resolver.query(collection, projection, selection, args, null)) {
+                      if (cursor == null) return 0;
+                      while (cursor.moveToNext()) {
+                          long id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID));
+                          Uri uri = ContentUris.withAppendedId(collection, id);
+                          deleted += resolver.delete(uri, null, null);
+                      }
+                  } catch (Exception ignored) {}
+                  return deleted;
+              }
+
+              private byte[] readAllBytes(InputStream input) throws Exception {
+                  if (input == null) throw new Exception("Could not open backup file");
+                  try (InputStream in = input; ByteArrayOutputStream buffer = new ByteArrayOutputStream()) {
+                      byte[] data = new byte[8192];
+                      int read;
+                      while ((read = in.read(data, 0, data.length)) != -1) {
+                          buffer.write(data, 0, read);
+                      }
+                      return buffer.toByteArray();
+                  }
+              }
+
+              private String normalizePublicDirectory(String directoryName) {
+                  if (directoryName != null && "Documents".equalsIgnoreCase(directoryName.trim())) return Environment.DIRECTORY_DOCUMENTS;
+                  return Environment.DIRECTORY_DOWNLOADS;
+              }
+          }
+          JAVAFILE
+
+          cat > "$JAVA_DIR/NativeBiometricAuthPlugin.java" <<'JAVAFILE'
+          package __CASHNEST_PACKAGE__;
+
+          import androidx.annotation.NonNull;
+          import androidx.biometric.BiometricManager;
+          import androidx.biometric.BiometricPrompt;
+          import androidx.core.content.ContextCompat;
+          import androidx.fragment.app.FragmentActivity;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.util.concurrent.Executor;
+
+          @CapacitorPlugin(name = "NativeBiometricAuth")
+          public class NativeBiometricAuthPlugin extends Plugin {
+              @PluginMethod
+              public void isAvailable(PluginCall call) {
+                  int authenticators = BiometricManager.Authenticators.BIOMETRIC_STRONG | BiometricManager.Authenticators.DEVICE_CREDENTIAL;
+                  int result = BiometricManager.from(getContext()).canAuthenticate(authenticators);
+                  JSObject ret = new JSObject();
+                  ret.put("available", result == BiometricManager.BIOMETRIC_SUCCESS);
+                  ret.put("code", result);
+                  call.resolve(ret);
+              }
+
+              @PluginMethod
+              public void verify(PluginCall call) {
+                  String title = call.getString("title", "Unlock CashNest X");
+                  String subtitle = call.getString("subtitle", "Use fingerprint or screen lock");
+
+                  getActivity().runOnUiThread(() -> {
+                      Executor executor = ContextCompat.getMainExecutor(getContext());
+                      BiometricPrompt prompt = new BiometricPrompt((FragmentActivity) getActivity(), executor, new BiometricPrompt.AuthenticationCallback() {
+                          @Override
+                          public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
+                              JSObject ret = new JSObject();
+                              ret.put("verified", true);
+                              call.resolve(ret);
+                          }
+
+                          @Override
+                          public void onAuthenticationError(int errorCode, @NonNull CharSequence errString) {
+                              call.reject(errString.toString());
+                          }
+
+                          @Override
+                          public void onAuthenticationFailed() {
+                              notifyListeners("biometricFailed", new JSObject());
+                          }
+                      });
+
+                      BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
+                          .setTitle(title)
+                          .setSubtitle(subtitle)
+                          .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG | BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+                          .build();
+                      prompt.authenticate(promptInfo);
+                  });
+              }
+          }
+          JAVAFILE
+
+          cat > android/app/src/main/res/xml/file_paths.xml <<'XMLFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <cache-path name="update_apk_cache" path="." />
+              <external-path name="external_downloads" path="." />
+              <external-files-path name="cashnest_x_update_files" path="." />
+          </paths>
+          XMLFILE
+
+
+          python3 <<'PYEOF'
+          import os
+          from pathlib import Path
+          java_dir = Path(os.environ['JAVA_DIR'])
+          package = os.environ['JAVA_PACKAGE']
+          for path in java_dir.glob('*.java'):
+              text = path.read_text()
+              text = text.replace('__CASHNEST_PACKAGE__', package)
+              path.write_text(text)
+          print(f"✅ Native Java package placeholders applied: {package}")
+          PYEOF
+
+          python3 <<'PYEOF'
+          from pathlib import Path
+          gradle = Path("android/app/build.gradle")
+          text = gradle.read_text()
+          import os
+          deps = [
+              '    implementation "androidx.biometric:biometric:1.1.0"',
+              '    implementation "com.google.mlkit:text-recognition:16.0.1"',
+          ]
+          if os.environ.get('GOOGLE_BACKUP_NATIVE_ENABLED') == 'true':
+              deps.append('    implementation "com.google.android.gms:play-services-auth:21.2.0"')
+          for dep in deps:
+              if dep not in text:
+                  text = text.replace("dependencies {", "dependencies {\n" + dep, 1)
+          gradle.write_text(text)
+          print("✅ AndroidX biometric, Google ML Kit, and optional Firebase Google Sign-In dependencies added")
+          PYEOF
+
+          python3 <<'PYEOF'
+          from pathlib import Path
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          m = manifest.read_text()
+          perms = [
+              '<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />',
+              '<uses-permission android:name="android.permission.CAMERA" />',
+              '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+          ]
+          for perm in perms:
+              if perm not in m:
+                  m = m.replace("<application", "    " + perm + "\n\n    <application", 1)
+          provider = "\n".join([
+              '        <provider',
+              '            android:name="androidx.core.content.FileProvider"',
+              '            android:authorities="${applicationId}.fileprovider"',
+              '            android:exported="false"',
+              '            android:grantUriPermissions="true">',
+              '            <meta-data',
+              '                android:name="android.support.FILE_PROVIDER_PATHS"',
+              '                android:resource="@xml/file_paths" />',
+              '        </provider>',
+          ])
+          if '${applicationId}.fileprovider' not in m:
+              m = m.replace("</application>", provider + "\n    </application>", 1)
+          notification_meta = "\n".join([
+              '        <meta-data android:name="com.cashnest_x.notification.default_icon" android:resource="@drawable/ic_stat_cashnest_x_notification" />',
+              '        <meta-data android:name="com.cashnest_x.notification.default_color" android:resource="@color/cashnest_x_notification_color" />',
+          ])
+          if 'com.cashnest_x.notification.default_icon' not in m:
+              m = m.replace("</application>", notification_meta + "\n    </application>", 1)
+          update_deep_link = "\n".join([
+              '            <intent-filter>',
+              '                <action android:name="android.intent.action.VIEW" />',
+              '                <category android:name="android.intent.category.DEFAULT" />',
+              '                <category android:name="android.intent.category.BROWSABLE" />',
+              '                <data android:scheme="cashnest_x" android:host="updates" />',
+              '                <data android:scheme="cashnest_x" android:host="updater" />',
+              '            </intent-filter>',
+          ])
+          if 'android:scheme="cashnest_x"' not in m and '</activity>' in m:
+              m = m.replace('</activity>', update_deep_link + "\n        </activity>", 1)
+          receiver = "\n".join([
+              '        <receiver',
+              '            android:name=".CashNestUpdateActionReceiver"',
+              '            android:exported="true">',
+              '            <intent-filter>',
+              '                <action android:name="android.intent.action.DOWNLOAD_COMPLETE" />',
+              '            </intent-filter>',
+              '        </receiver>',
+          ])
+          if 'CashNestUpdateActionReceiver' not in m:
+              m = m.replace("</application>", receiver + "\n    </application>", 1)
+          manifest.write_text(m)
+          print("✅ Android in-app APK installer and notification metadata patched")
+          PYEOF
+
+          echo "✅ Native APK updater, Android fingerprint biometric, Firebase Google login, encrypted local backup, and Downloads export plugins patched"
+
+      # ── 11. Generate Android launcher icons ───────────────────────────────────
+      - name: Install Pillow
+        run: pip install Pillow numpy --break-system-packages -q
+
+      - name: Generate Android app icons
+        run: |
+          python3 << 'PYEOF'
+          from PIL import Image
+          import os, numpy as np
+
+          SRC = "public/icon-1024.png" if os.path.exists("public/icon-1024.png") else "public/icon-512.png"
+          RES = "android/app/src/main/res"
+          DARK_BG = (13, 15, 20, 255)
+
+          SIZES = {
+              "mipmap-mdpi":    (48,  108),
+              "mipmap-hdpi":    (72,  162),
+              "mipmap-xhdpi":   (96,  216),
+              "mipmap-xxhdpi":  (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          # Keep the 512 icon canvas exactly as designed.
+          # Do NOT auto-crop transparent rounded corners, because Android adaptive
+          # icons will become over-zoomed on Xiaomi/HyperOS launchers.
+          src = Image.open(SRC).convert("RGBA")
+
+          def fit_on_square(img, size, scale=0.86):
+              # Transparent corners prevent the black square/outline seen on launchers
+              # that still use legacy PNG icons.
+              canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              target = int(size * scale)
+              fitted = img.resize((target, target), Image.LANCZOS)
+              canvas.alpha_composite(fitted, ((size - target) // 2, (size - target) // 2))
+              return canvas
+
+          for folder, (launcher_px, fg_px) in SIZES.items():
+              path = os.path.join(RES, folder)
+              os.makedirs(path, exist_ok=True)
+
+              # Legacy launcher icons need padding so the wallet is not cropped/zoomed.
+              legacy = fit_on_square(src, launcher_px, 0.94)
+              legacy.save(os.path.join(path, "ic_launcher.png"), "PNG")
+              legacy.save(os.path.join(path, "ic_launcher_round.png"), "PNG")
+
+              # Adaptive foreground canvas is larger than the visible icon.
+              # Keep the artwork inside the safe zone for all launchers.
+              fg = Image.new("RGBA", (fg_px, fg_px), (0, 0, 0, 0))
+              target = int(fg_px * 0.68)
+              fg_img = src.resize((target, target), Image.LANCZOS)
+              offset = ((fg_px - target) // 2, (fg_px - target) // 2)
+              fg.alpha_composite(fg_img, offset)
+              fg.save(os.path.join(path, "ic_launcher_foreground.png"), "PNG")
+
+          print("✅ Android icon sizes generated from high-quality PNG with adaptive safe-zone padding")
+          PYEOF
+
+          cat > android/app/src/main/res/drawable/ic_launcher_background.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android">
+              <solid android:color="#111827"/>
+          </shape>
+          XML
+          sed -i 's|<color name="ic_launcher_background">.*</color>|<color name="ic_launcher_background">#111827</color>|' \
+            android/app/src/main/res/values/ic_launcher_background.xml 2>/dev/null || true
+
+          mkdir -p android/app/src/main/res/drawable
+          cat > android/app/src/main/res/drawable/ic_stat_cashnest_x_notification.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M14,10h20c4.4,0 8,3.6 8,8v2H14c-4.4,0 -8,-2.2 -8,-5s3.6,-5 8,-5z"/>
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M8,19h29c4.4,0 8,3.6 8,8v9c0,4.4 -3.6,8 -8,8H12c-4.4,0 -8,-3.6 -8,-8V23c0,-2.2 1.8,-4 4,-4zM33,29h12v8H33c-2.2,0 -4,-1.8 -4,-4s1.8,-4 4,-4z"/>
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M17,29h3v-2h4v2h3v4h-3v2h3v4h-3v2h-4v-2h-3v-4h3v-2h-3z"/>
+          </vector>
+          XML
+          mkdir -p android/app/src/main/res/drawable-anydpi-v24
+          cp android/app/src/main/res/drawable/ic_stat_cashnest_x_notification.xml \
+             android/app/src/main/res/drawable-anydpi-v24/ic_stat_cashnest_x_notification.xml
+          mkdir -p android/app/src/main/res/values
+          cat > android/app/src/main/res/values/cashnest_x_notification_color.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="cashnest_x_notification_color">#F97316</color>
+          </resources>
+          XML
+          mkdir -p android/app/src/main/res/drawable-nodpi
+          python3 << 'PYEOF'
+          from pathlib import Path
+          from PIL import Image
+          src_path = Path('public/icon-1024.png') if Path('public/icon-1024.png').exists() else Path('public/icon-512.png')
+          img = Image.open(src_path).convert('RGBA')
+          side = max(img.size)
+          canvas = Image.new('RGBA', (side, side), (0, 0, 0, 0))
+          canvas.alpha_composite(img, ((side - img.width) // 2, (side - img.height) // 2))
+          icon = canvas.resize((256, 256), Image.LANCZOS)
+          icon.save('android/app/src/main/res/drawable-nodpi/ic_cashnest_x_notification_large.png', 'PNG', optimize=True)
+          PYEOF
+          echo "✅ Adaptive icon background, clean small notification icon, and matching lock-screen app icon generated"
+
+      # ── Patch build.gradle — Android versionCode from run, visible versionName from app version ──
+      - name: Patch build.gradle version
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          APP_VERSION: ${{ env.VERSION }}
+        run: |
+          cat > /tmp/patch-gradle.py << 'PEOF'
+          import re, os
+          path = "android/app/build.gradle"
+          code = os.environ["RUN_NUMBER"]
+          name = os.environ["APP_VERSION"]
+          txt = open(path).read()
+          txt = re.sub(r"versionCode \d+", "versionCode " + code, txt)
+          txt = re.sub(r'versionName "[^"]*"', 'versionName "' + name + '"', txt)
+          open(path, "w").write(txt)
+          print("✅ Android versionCode=" + code + "  versionName=" + name)
+          PEOF
+          python3 /tmp/patch-gradle.py
+
+      - name: Write Android SDK path (local.properties)
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Sync web assets into Android project
+        run: npx cap sync android
+
+      - name: Regenerate Android icons after Capacitor sync
+        run: python3 scripts/generate_android_icons.py
+
+      # ── 12. Make gradlew executable ───────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      # ── 13. Decode keystore ───────────────────────────────────────────────────
+      - name: Decode keystore
+        run: |
+          KEYSTORE_PATH="${{ github.workspace }}/android/app/cashnest_x-release.jks"
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > "$KEYSTORE_PATH"
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+
+      # ── 14. Print SHA-1 fingerprint ───────────────────────────────────────────
+      - name: Print release keystore SHA-1
+        run: |
+          SHA1=$(keytool -list -v \
+            -keystore "$KEYSTORE_PATH" \
+            -alias "${{ secrets.KEY_ALIAS }}" \
+            -storepass "${{ secrets.STORE_PASSWORD }}" \
+            -noprompt 2>/dev/null | grep "SHA1:" | head -1 | awk '{print $2}')
+          echo "### 🔑 Release Keystore SHA-1" >> $GITHUB_STEP_SUMMARY
+          echo "Public APK package fingerprint:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$SHA1"  >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "📋 Package name: **$PACKAGE_NAME**" >> $GITHUB_STEP_SUMMARY
+
+      # ── 15. Build signed release APK ──────────────────────────────────────────
+      - name: Build release APK
+        id: build_apk
+        working-directory: android
+        env:
+          KEY_ALIAS:      ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD:   ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=$KEYSTORE_PATH \
+            -Pandroid.injected.signing.store.password=$STORE_PASSWORD \
+            -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
+            -Pandroid.injected.signing.key.password=$KEY_PASSWORD \
+            2>&1 | tee /tmp/gradle-build.log
+          exit ${PIPESTATUS[0]}
+
+      # ── 16. Rename APK ────────────────────────────────────────────────────────
+      - name: Rename APK
+        run: |
+          mv android/app/build/outputs/apk/release/app-release.apk \
+             android/app/build/outputs/apk/release/${{ env.APK_NAME }}
+
+      # ── 17. Upload APK as workflow artifact ───────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: android/app/build/outputs/apk/release/${{ env.APK_NAME }}
+          retention-days: 30
+
+
+      # ── 18. Generate current-release notes ─────────────────────────────────
+      - name: Generate automatic release notes
+        run: npm run release:notes
+        env:
+          VERSION: ${{ env.VERSION }}
+          TAG: ${{ env.TAG }}
+          APK_NAME: ${{ env.APK_NAME }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GITHUB_SHA: ${{ github.sha }}
+
+      # ── 18. Create or update GitHub Release ───────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "CashNest X ${{ env.TAG }}"
+          body_path: RELEASE_NOTES.md
+          files: android/app/build/outputs/apk/release/${{ env.APK_NAME }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          make_latest: true
+
+      # ── 19. Job Summary — SUCCESS ─────────────────────────────────────────────
+      - name: Write success summary
+        if: success()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ Build Succeeded
+          | Field | Value |
+          |-------|-------|
+          | **Version** | \`${{ env.TAG }}\` |
+          | **Run** | \`#${{ github.run_number }}\` |
+          | **APK** | \`${{ env.APK_NAME }}\` |
+          | **Package** | \`$(node -e "console.log(JSON.parse(require('fs').readFileSync('capacitor.config.json','utf8')).appId)")\` |
+          | **Commit** | [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |
+          | **Triggered by** | \`${{ github.event_name }}\` |
+          EOF
+
+      # ── 20. Job Summary — FAILURE ─────────────────────────────────────────────
+      - name: Write failure summary
+        if: failure()
+        run: |
+          GRADLE_LOG=""
+          if [ -f /tmp/gradle-build.log ]; then
+            GRADLE_LOG=$(tail -100 /tmp/gradle-build.log)
+          fi
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+          ## ❌ Build Failed
+          ### Last 100 lines of Gradle log
+          \`\`\`
+          ${GRADLE_LOG:-No Gradle log captured — check the step logs above.}
+          \`\`\`
+          ### Common fixes
+          | Error | Fix |
+          |-------|-----|
+          | \`KEYSTORE_BASE64\` | Check GitHub Secrets are set correctly |
+          | \`SDK location not found\` | The Android SDK path/component setup step may have failed |
+          | \`Could not resolve com.android\` | Network issue — re-run the workflow |
+          | \`STORE_PASSWORD / KEY_PASSWORD\` | Check keystore passwords and alias |
+          SUMMARY
