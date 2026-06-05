@@ -1,0 +1,23 @@
+node_modules
+dist
+android
+.env
+.DS_Store
+npm-debug.log*
+
+# Android release signing files
+*.jks
+*.keystore
+cashnest_x-base64.txt
+cashnest_x-release.jks
+# Local env / Cloudflare Worker deploy output
+.env.local
+.env.*
+!.env.example
+.env.cloudflare.worker
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+cloudflare-worker/wrangler.toml
+!.env.cloudflare.worker.example
+cloudflare-worker/metadata.json
+cloudflare-worker/.env

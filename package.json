@@ -1,0 +1,35 @@
+{
+  "name": "cashnest_x-public-apk",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "dev:local": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "cap:add:android": "cap add android",
+    "cap:sync": "cap sync android",
+    "release:check": "npm run deep:check && npm run calculation:check && node scripts/release-check.cjs",
+    "release:notes": "node scripts/generate-release-notes.cjs",
+    "deep:check": "node scripts/deep-check.cjs && npm run version:check",
+    "version:check": "node scripts/version-check.cjs",
+    "calculation:check": "node scripts/calculation-check.cjs",
+    "deploy:worker:termux": "bash scripts/deploy-cloudflare-worker-termux.sh",
+    "test:worker": "bash scripts/test-cloudflare-worker.sh",
+    "check:worker": "node --check cloudflare-worker/src/index.js && node --check cloudflare-worker/worker.js"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.1",
+    "@capacitor/app": "^6.0.2",
+    "@capacitor/camera": "^6.0.2",
+    "@capacitor/cli": "^6.2.1",
+    "@capacitor/core": "^6.2.1",
+    "@capacitor/local-notifications": "^6.1.0",
+    "@vitejs/plugin-react": "4.2.1",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "vite": "4.5.3"
+  },
+  "description": "CashNest X Firebase Google login + Cloudflare Workers KV multi-device money manager APK."
+}

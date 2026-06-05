@@ -1,0 +1,14 @@
+{
+  "appId": "com.cashnest_x.pub",
+  "appName": "CashNest X",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_cashnest_x_notification",
+      "iconColor": "#2DD4BF"
+    }
+  }
+}

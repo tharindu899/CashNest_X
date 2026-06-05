@@ -1,0 +1,79 @@
+<svg width="1200" height="360" viewBox="0 0 1200 360" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="bannerTitle bannerDesc">
+  <title id="bannerTitle">CashNest X banner</title>
+  <desc id="bannerDesc">CashNest X Firebase Google login and Cloudflare KV backup banner with wallet icon, app name, and sync feature badges.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0F172A"/>
+      <stop offset="0.45" stop-color="#312E81"/>
+      <stop offset="1" stop-color="#7C2D12"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="88" y1="54" x2="308" y2="288" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset="0.48" stop-color="#DB2777"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="wallet" x1="126" y1="110" x2="286" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FFF7ED"/>
+    </linearGradient>
+    <linearGradient id="accentLine" x1="352" y1="0" x2="962" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F97316"/>
+      <stop offset="0.5" stop-color="#DB2777"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="360" rx="34" fill="url(#bg)"/>
+  <circle cx="175" cy="160" r="210" fill="#DB2777" opacity="0.18"/>
+  <circle cx="1050" cy="90" r="230" fill="#F97316" opacity="0.16"/>
+  <circle cx="1088" cy="302" r="150" stroke="#FDBA74" stroke-width="2" opacity="0.18"/>
+  <circle cx="1005" cy="48" r="78" stroke="#FFFFFF" stroke-width="1" opacity="0.18"/>
+
+  <!-- App icon: visible wallet mark, fully inline so GitHub README renders it reliably. -->
+  <rect x="70" y="70" width="236" height="236" rx="66" fill="#000000" opacity="0.20"/>
+  <g>
+    <rect x="78" y="58" width="236" height="236" rx="66" fill="url(#brand)"/>
+    <rect x="78" y="58" width="236" height="236" rx="66" fill="#FFFFFF" opacity="0.08"/>
+    <circle cx="262" cy="96" r="42" fill="#FFFFFF" opacity="0.13"/>
+    <path d="M132 134C132 111.9 149.9 94 172 94H235C257.1 94 275 111.9 275 134V157H132V134Z" fill="#FED7AA"/>
+    <rect x="112" y="148" width="178" height="112" rx="36" fill="url(#wallet)"/>
+    <rect x="112" y="148" width="178" height="112" rx="36" stroke="#FFFFFF" stroke-width="6" opacity="0.35"/>
+    <path d="M206 184C206 168.5 218.5 156 234 156H305V228H234C218.5 228 206 215.5 206 200V184Z" fill="#111827"/>
+    <circle cx="255" cy="192" r="15" fill="#F97316"/>
+    <path d="M138 190L190 242" stroke="#7C3AED" stroke-width="20" stroke-linecap="round"/>
+    <path d="M190 190L138 242" stroke="#DB2777" stroke-width="20" stroke-linecap="round"/>
+    <path d="M144 190L184 230" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" opacity="0.65"/>
+  </g>
+
+  <!-- Main text: large and high contrast. -->
+  <text x="354" y="136" font-family="Arial, Helvetica, sans-serif" font-size="78" font-weight="900" letter-spacing="-2.5" fill="#FFFFFF">CashNest X</text>
+  <text x="358" y="178" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="800" letter-spacing="3.5" fill="#FDBA74">FIREBASE LOGIN · KV SYNC · MONEY MANAGER</text>
+  <text x="358" y="212" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#E5E7EB">Private-first expense tracker with Firebase login and Cloudflare KV sync.</text>
+  <rect x="358" y="226" width="595" height="5" rx="3" fill="url(#accentLine)"/>
+
+  <!-- Feature badges. -->
+  <g font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="800">
+    <rect x="358" y="252" width="132" height="40" rx="14" fill="#FFFFFF" opacity="0.10" stroke="#F97316" stroke-opacity="0.65"/>
+    <text x="378" y="278" fill="#FED7AA">React</text>
+    <rect x="506" y="252" width="112" height="40" rx="14" fill="#FFFFFF" opacity="0.10" stroke="#DB2777" stroke-opacity="0.65"/>
+    <text x="526" y="278" fill="#FBCFE8">Vite</text>
+    <rect x="634" y="252" width="164" height="40" rx="14" fill="#FFFFFF" opacity="0.10" stroke="#8B5CF6" stroke-opacity="0.70"/>
+    <text x="654" y="278" fill="#DDD6FE">Capacitor</text>
+    <rect x="814" y="252" width="142" height="40" rx="14" fill="#FFFFFF" opacity="0.10" stroke="#22C55E" stroke-opacity="0.65"/>
+    <text x="834" y="278" fill="#BBF7D0">Backup</text>
+  </g>
+
+  <!-- Right side currency bubbles. -->
+  <g font-family="Arial, Helvetica, sans-serif" font-weight="900">
+    <circle cx="1024" cy="144" r="42" fill="#F97316" opacity="0.18" stroke="#FDBA74" stroke-width="2"/>
+    <text x="1003" y="155" font-size="27" fill="#FDBA74">Rs</text>
+    <circle cx="1092" cy="222" r="29" fill="#DB2777" opacity="0.18" stroke="#FBCFE8" stroke-width="2"/>
+    <text x="1081" y="233" font-size="25" fill="#FBCFE8">$</text>
+    <circle cx="1000" cy="270" r="23" fill="#7C3AED" opacity="0.22" stroke="#DDD6FE" stroke-width="2"/>
+    <text x="991" y="279" font-size="20" fill="#DDD6FE">€</text>
+  </g>
+
+  <rect x="0" y="350" width="1200" height="10" fill="url(#accentLine)" opacity="0.95"/>
+  <rect x="0.5" y="0.5" width="1199" height="359" rx="33.5" stroke="#FFFFFF" opacity="0.12"/>
+</svg>

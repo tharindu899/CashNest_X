@@ -1,0 +1,10 @@
+# Optional desktop/PC Wrangler config for CashNest X Cloudflare Worker KV.
+# Termux users should use: bash scripts/deploy-cloudflare-worker-termux.sh
+name = "cashnest-x-backup-api"
+main = "src/index.js"
+compatibility_date = "2026-06-05"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "BACKUP_KV"
+id = "paste-your-kv-namespace-id"
