@@ -26,6 +26,64 @@ CashNest X is a modern Android money manager built with **React + Vite + Capacit
 
 ---
 
+## 🖼️ App screenshots — `public/photo` examples
+
+<details open>
+<summary>🌑 Dark mode screenshots</summary>
+
+| 🏠 Home | ➕ Add record | 📒 Records |
+| --- | --- | --- |
+| <img src="public/photo/d-home.jpg" alt="CashNest X dark home screen" width="220" /> | <img src="public/photo/d-add.jpg" alt="CashNest X dark add record screen" width="220" /> | <img src="public/photo/d-recod.jpg" alt="CashNest X dark records screen" width="220" /> |
+
+| 📊 Analytics | ⚙️ Settings |
+| --- | --- |
+| <img src="public/photo/d-analysis.jpg" alt="CashNest X dark analytics screen" width="220" /> | <img src="public/photo/d-setting.jpg" alt="CashNest X dark settings screen" width="220" /> |
+
+</details>
+
+<details>
+<summary>☀️ Light mode screenshots</summary>
+
+| 🏠 Home | 📒 Records |
+| --- | --- |
+| <img src="public/photo/l-home.jpg" alt="CashNest X light home screen" width="220" /> | <img src="public/photo/l-recode.jpg" alt="CashNest X light records screen" width="220" /> |
+
+| 📊 Analytics | ⚙️ Settings |
+| --- | --- |
+| <img src="public/photo/l-analysis.jpg" alt="CashNest X light analytics screen" width="220" /> | <img src="public/photo/l-setting.jpg" alt="CashNest X light settings screen" width="220" /> |
+
+</details>
+
+<details>
+<summary>🧩 Copy-paste example table method for new photos</summary>
+
+Use this same pattern when adding new images to `public/photo/`:
+
+```md
+<details>
+<summary>📱 Screenshot group title</summary>
+
+| Screen | File path | Preview |
+| --- | --- | --- |
+| 🏠 Home | `public/photo/d-home.jpg` | <img src="public/photo/d-home.jpg" alt="Home screenshot" width="180" /> |
+| ⚙️ Settings | `public/photo/d-setting.jpg` | <img src="public/photo/d-setting.jpg" alt="Settings screenshot" width="180" /> |
+
+</details>
+```
+
+Recommended screenshot size:
+
+```txt
+📱 Width: 1080px
+📱 Height: 2400px or phone screenshot size
+🎨 Theme: add both dark mode and light mode when possible
+📂 Folder: public/photo/
+```
+
+</details>
+
+---
+
 ## 🧠 Current cloud design
 
 ```text
